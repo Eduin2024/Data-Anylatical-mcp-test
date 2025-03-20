@@ -8,16 +8,21 @@ from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 import mcp.types as types
+import pandas as pd
+import json
+# Add pandas configuration
+pd.set_option('display.max_colwidth', None)
+pd.set_option('display.max_rows', None)
+pd.set_option('display.width', 1000)
 
 class PythonREPLServer:
     def __init__(self):
         self.server = Server("python-repl")
-        # Shared namespace for all executions
         self.global_namespace = {
             "__builtins__": __builtins__,
+            "pd": pd,
         }
         
-        # Set up handlers using decorators
         @self.server.list_tools()
         async def handle_list_tools() -> list[types.Tool]:
             return await self.handle_list_tools()
@@ -27,7 +32,6 @@ class PythonREPLServer:
             return await self.handle_call_tool(name, arguments)
 
     async def handle_list_tools(self) -> list[types.Tool]:
-        """List available tools"""
         return [
             types.Tool(
                 name="execute_python",
@@ -75,7 +79,6 @@ class PythonREPLServer:
     async def handle_call_tool(
         self, name: str, arguments: dict | None
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        """Handle tool execution requests"""
         if not arguments:
             raise ValueError("Missing arguments")
         
@@ -84,10 +87,10 @@ class PythonREPLServer:
             if not code:
                 raise ValueError("Missing code parameter")
 
-            # Check if we should reset the session
             if arguments.get("reset", False):
                 self.global_namespace.clear()
                 self.global_namespace["__builtins__"] = __builtins__
+                self.global_namespace["pd"] = pd
                 return [
                     types.TextContent(
                         type="text",
@@ -95,51 +98,56 @@ class PythonREPLServer:
                     )
                 ]
 
-            # Capture stdout and stderr
             stdout = io.StringIO()
             stderr = io.StringIO()
             
             try:
-                # Execute code with output redirection
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     exec(code, self.global_namespace)
                 
-                # Combine output
                 output = stdout.getvalue()
                 errors = stderr.getvalue()
                 
-                # Add success logging
-                print(f"[success] Code executed successfully. Output size: {len(output)}, Errors size: {len(errors)}")
-                
-                # Format response
-                result = ""
+                result = {}
                 if output:
-                    result += f"Output:\n{output}"
+                    result["output"] = output
                 if errors:
-                    result += f"\nErrors:\n{errors}"
-                if not output and not errors:
-                    # Try to get the value of the last expression
-                    try:
-                        last_line = code.strip().split('\n')[-1]
-                        last_value = eval(last_line, self.global_namespace)
-                        result = f"Result: {repr(last_value)}"
-                    except (SyntaxError, ValueError, NameError):
-                        result = "Code executed successfully (no output)"
+                    result["errors"] = errors
+
+                last_line = code.strip().split('\n')[-1]
+                last_value = eval(last_line, self.global_namespace)
                 
+                if isinstance(last_value, pd.DataFrame):
+                    df_json = {
+                        "type": "dataframe",
+                        "data": last_value.to_dict(orient="records"),
+                        "columns": last_value.columns.tolist(),
+                        "shape": list(last_value.shape)
+                    }
+                    return [
+                        types.TextContent(
+                            type="text",
+                            text=json.dumps(df_json)
+                        )
+                    ]
+                elif isinstance(last_value, (list, dict)):
+                    result["result"] = last_value
+                else:
+                    result["result"] = repr(last_value)
+
                 return [
                     types.TextContent(
                         type="text",
-                        text=result
+                        text=json.dumps(result)
                     )
                 ]
                     
-            except Exception as e:  # noqa: F841
-                # Capture and format any exceptions
+            except Exception as e:
                 error_msg = f"Error executing code:\n{traceback.format_exc()}"
                 return [
                     types.TextContent(
                         type="text",
-                        text=error_msg
+                        text=json.dumps({"error": error_msg})
                     )
                 ]
 
@@ -148,7 +156,6 @@ class PythonREPLServer:
             if not package:
                 raise ValueError("Missing package name")
                 
-            # First ensure pip is installed
             try:
                 subprocess.run(
                     ["uv", "pip", "install", "pip"],
@@ -160,50 +167,46 @@ class PythonREPLServer:
                 return [
                     types.TextContent(
                         type="text",
-                        text=f"Failed to install pip: {e.stderr}"
+                        text=json.dumps({"error": f"Failed to install pip: {e.stderr}"})
                     )
                 ]
             
-            # Basic package name validation
             if not re.match("^[A-Za-z0-9][A-Za-z0-9._-]*$", package):
                 return [
                     types.TextContent(
                         type="text",
-                        text=f"Invalid package name: {package}"
+                        text=json.dumps({"error": f"Invalid package name: {package}"})
                     )
                 ]
             
             try:
-                # Install package using uv
                 process = subprocess.run(
                     ["uv", "pip", "install", package],
                     capture_output=True,
                     text=True,
                     check=True
                 )
-
                 if process.returncode != 0:
                     return [
                         types.TextContent(
                             type="text",
-                            text=f"Failed to install package: {process.stderr}"
+                            text=json.dumps({"error": f"Failed to install package: {process.stderr}"})
                         )
                     ]
                 
-                # Import the package to make it available in the REPL
                 try:
                     exec(f"import {package.split('[')[0]}", self.global_namespace)
                     return [
                         types.TextContent(
                             type="text",
-                            text=f"Successfully installed and imported {package}"
+                            text=json.dumps({"success": f"Successfully installed and imported {package}"})
                         )
                     ]
                 except ImportError as e:
                     return [
                         types.TextContent(
                             type="text",
-                            text=f"Package installed but import failed: {str(e)}"
+                            text=json.dumps({"error": f"Package installed but import failed: {str(e)}"})
                         )
                     ]
                     
@@ -211,31 +214,20 @@ class PythonREPLServer:
                 return [
                     types.TextContent(
                         type="text",
-                        text=f"Failed to install package:\n{e.stderr}"
+                        text=json.dumps({"error": f"Failed to install package:\n{e.stderr}"})
                     )
                 ]
                 
         elif name == "list_variables":
-            # Filter out builtins and private variables
             vars_dict = {
                 k: repr(v) for k, v in self.global_namespace.items() 
                 if not k.startswith('_') and k != '__builtins__'
             }
             
-            if not vars_dict:
-                return [
-                    types.TextContent(
-                        type="text",
-                        text="No variables in current session."
-                    )
-                ]
-            
-            # Format variables list
-            var_list = "\n".join(f"{k} = {v}" for k, v in vars_dict.items())
             return [
                 types.TextContent(
                     type="text",
-                    text=f"Current session variables:\n\n{var_list}"
+                    text=json.dumps({"variables": vars_dict})
                 )
             ]
             
@@ -243,7 +235,6 @@ class PythonREPLServer:
             raise ValueError(f"Unknown tool: {name}")
 
     async def run(self):
-        """Run the server"""
         async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
             await self.server.run(
                 read_stream,
